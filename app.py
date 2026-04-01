@@ -1,4 +1,4 @@
-# app.py (с доработками для YandexART и STT)
+# app.py (финальная версия)
 import os
 import logging
 import json
@@ -6,6 +6,7 @@ import requests
 import sqlite3
 import base64
 import time
+import socket
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -266,8 +267,18 @@ def recognize_image(file_content: bytes) -> str:
         logging.error(f"Vision error: {e}")
         return "⚠️ Не удалось распознать изображение."
 
-# ================== YANDEXART (генерация изображений) с повторными попытками ==================
+# ================== YANDEXART (генерация изображений) с диагностикой DNS ==================
+def check_dns(hostname):
+    try:
+        socket.gethostbyname(hostname)
+        return True
+    except socket.error:
+        return False
+
 def generate_image(prompt: str) -> bytes:
+    # Предварительная проверка DNS
+    if not check_dns("api.ai.yandex.net"):
+        return None  # ошибка будет обработана в handle_state_input
     url = "https://api.ai.yandex.net/art/v1/images/generation"
     headers = {
         "Authorization": f"Api-Key {API_KEY}",
@@ -279,7 +290,6 @@ def generate_image(prompt: str) -> bytes:
         "messages": [{"role": "user", "text": prompt}]
     }
 
-    # Попытки с повторным запросом при DNS-ошибке
     for attempt in range(2):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -500,9 +510,15 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         if img_data:
             send_telegram_photo(chat_id, img_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
         else:
-            reply = "⚠️ Не удалось сгенерировать изображение. Возможные причины: недостаточно прав (роль `ai.art.user`) или временные проблемы с сервером."
+            # Диагностика
+            if not check_dns("api.ai.yandex.net"):
+                reply = "⚠️ Не удалось подключиться к серверу YandexART. Проверьте доступность api.ai.yandex.net из вашего окружения Railway. Возможно, требуется добавить прокси или использовать другой хостинг."
+            else:
+                reply = "⚠️ Не удалось сгенерировать изображение. Возможные причины: недостаточно прав (роль `ai.art.user` у сервисного аккаунта) или временные проблемы с сервером."
         decrement_request(user_id)
         del user_states[user_id]
+        if reply:
+            send_telegram_message(chat_id, reply)
         send_main_keyboard(chat_id, "Что ещё сделать?")
         return
     else:

@@ -1,4 +1,4 @@
-# app.py (SQLite version with fixed callback handling)
+# app.py
 import os
 import logging
 import json
@@ -12,7 +12,6 @@ from flask_cors import CORS
 FOLDER_ID = os.environ.get('FOLDER_ID')
 API_KEY = os.environ.get('API_KEY')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-# ADMIN_IDS может быть строкой с числами через запятую
 ADMIN_IDS = [int(id.strip()) for id in os.environ.get('ADMIN_IDS', '').split(',') if id.strip()]
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
@@ -116,11 +115,14 @@ def send_telegram_message(chat_id: int, text: str, reply_markup=None):
 
 # ================== YANDEXGPT ИНТЕГРАЦИЯ ==================
 def call_yandexgpt(system_prompt: str, user_message: str) -> str:
+    # Обрезаем длинные сообщения, чтобы не превышать лимиты
+    if len(user_message) > 3000:
+        user_message = user_message[:3000] + "…"
     prompt = {
         "modelUri": f"gpt://{FOLDER_ID}/yandexgpt-lite",
         "completionOptions": {"stream": False, "temperature": 0.6, "maxTokens": 2000},
         "messages": [
-            {"role": "system", "text": system_prompt},
+            {"role": "system", "text": system_prompt[:1000]},  # ограничим system prompt
             {"role": "user", "text": user_message}
         ]
     }
@@ -131,10 +133,11 @@ def call_yandexgpt(system_prompt: str, user_message: str) -> str:
             json=prompt,
             timeout=30
         )
+        logging.info(f"YandexGPT status: {resp.status_code}, body: {resp.text[:500]}")
         if resp.status_code == 200:
             return resp.json()['result']['alternatives'][0]['message']['text']
         else:
-            return f"⚠️ Ошибка YandexGPT: {resp.status_code}"
+            return f"⚠️ Ошибка YandexGPT: {resp.status_code} - {resp.text}"
     except Exception as e:
         logging.error(f"YandexGPT error: {e}")
         return "⚠️ Не удалось получить ответ. Попробуйте позже."
@@ -153,12 +156,11 @@ def explain_concept(concept: str) -> str:
 
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
 def handle_telegram_update(update):
-    # ** ВАЖНО: сначала обрабатываем callback-запросы (кнопки) **
+    # Обрабатываем callback-запросы (кнопки) в первую очередь
     if "callback_query" in update:
         handle_callback(update["callback_query"])
         return
 
-    # Если нет ни сообщения, ни callback — выходим
     if "message" not in update:
         return
 
@@ -176,7 +178,7 @@ def handle_telegram_update(update):
                        (user_id, username, first_name))
         conn.commit()
 
-    # Обработка команд
+    # Команды
     if text == "/start":
         kb = {
             "inline_keyboard": [
@@ -226,7 +228,7 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    # Обычное текстовое сообщение (не команда)
+    # Обычное сообщение (не команда) – используем AI
     if not can_make_request(user_id):
         send_telegram_message(chat_id,
                               "⚠️ Ты исчерпал лимит бесплатных запросов на сегодня.\n"
@@ -243,7 +245,7 @@ def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
     user_id = callback["from"]["id"]
     data = callback["data"]
-    # Обязательно отвечаем на callback, чтобы кнопка перестала грузиться
+    # Обязательно отвечаем на callback, чтобы кнопка перестала крутиться
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
                   json={"callback_query_id": callback["id"]})
 

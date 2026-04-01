@@ -1,4 +1,4 @@
-# app.py (без генерации изображений, все остальные функции работают)
+# app.py (финальная версия с интеграцией сайта)
 import os
 import logging
 import json
@@ -367,7 +367,7 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    # Обработка кнопок обычной клавиатуры (без генерации изображений)
+    # Обработка кнопок обычной клавиатуры
     if text in ["📝 Пересказать текст", "📝 Создать тест", "🔍 Объяснить понятие",
                 "✍️ Написать эссе", "🔢 Реши задачу", "📷 Распознать текст"]:
         if not can_make_request(user_id):
@@ -401,13 +401,11 @@ def handle_telegram_update(update):
         user_states[user_id] = "recognize_voice"
 
     elif text == "⭐ Премиум":
-        kb = {
-            "inline_keyboard": [
-                [{"text": "💎 Премиум (250 запросов/мес) — 150 руб", "callback_data": "buy_premium"}],
-                [{"text": "💎 Премиум+ (500 запросов/мес) — 300 руб", "callback_data": "buy_premium_plus"}]
-            ]
-        }
-        send_telegram_message(chat_id, "🌟 **Выберите тариф:**", json.dumps(kb))
+        # Ссылка на сайт с параметрами
+        username = msg["from"].get("username", str(user_id))
+        payment_link = f"https://annually-immediate-yak.tilda.ws/?user_id={user_id}&tg_username={username}"
+        kb = {"inline_keyboard": [[{"text": "💳 Перейти на сайт", "url": payment_link}]]}
+        send_telegram_message(chat_id, "🌟 **Выберите тариф на сайте:**", json.dumps(kb))
 
     elif text == "🎁 Рефералка":
         ref_link = f"https://t.me/unistudyhelper_bot?start=ref_{user_id}"
@@ -559,14 +557,17 @@ def handle_callback(callback):
     else:
         return
 
-    payment_link = f"https://your-tilda-site.ru/payment?user_id={user_id}&plan={plan}"
+    # Получаем username пользователя для передачи на сайт
+    username = callback["from"].get("username", str(user_id))
+    # Ссылка на сайт с параметрами
+    payment_link = f"https://annually-immediate-yak.tilda.ws/?user_id={user_id}&tg_username={username}&plan={plan}"
     kb = {"inline_keyboard": [[{"text": f"💳 Оплатить {amount} руб", "url": payment_link}]]}
     send_telegram_message(chat_id,
                           f"💳 **Оформление подписки {plan.upper()}**\n\n"
                           f"Стоимость: **{amount} руб/мес**\n"
                           f"Количество запросов: **{requests_limit}** в месяц\n\n"
-                          "После оплаты подписка активируется автоматически.\n"
-                          "🔗 Нажми на кнопку ниже:",
+                          "🔗 Нажми на кнопку ниже, чтобы перейти к оплате на сайте.\n"
+                          "После успешной оплаты подписка активируется автоматически.",
                           json.dumps(kb))
 
 # ================== ВЕБХУК ==================

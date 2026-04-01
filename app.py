@@ -1,4 +1,4 @@
-# app.py (финальная версия)
+# app.py (с доработками для YandexART и STT)
 import os
 import logging
 import json
@@ -163,11 +163,6 @@ def send_telegram_photo(chat_id: int, photo_data: bytes, caption: str = ""):
     data = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
     requests.post(url, data=data, files=files)
 
-def send_telegram_voice(chat_id: int, file_id: str, caption: str = ""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVoice"
-    payload = {"chat_id": chat_id, "voice": file_id, "caption": caption, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
-
 def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню"):
     keyboard = {
         "keyboard": [
@@ -271,7 +266,7 @@ def recognize_image(file_content: bytes) -> str:
         logging.error(f"Vision error: {e}")
         return "⚠️ Не удалось распознать изображение."
 
-# ================== YANDEXART (генерация изображений) ==================
+# ================== YANDEXART (генерация изображений) с повторными попытками ==================
 def generate_image(prompt: str) -> bytes:
     url = "https://api.ai.yandex.net/art/v1/images/generation"
     headers = {
@@ -283,17 +278,25 @@ def generate_image(prompt: str) -> bytes:
         "generationOptions": {"seed": 0},
         "messages": [{"role": "user", "text": prompt}]
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
-            logging.error(f"ImageGeneration create error: {resp.status_code} {resp.text}")
-            return None
-        operation_id = resp.json().get("id")
-        if not operation_id:
-            return None
-    except Exception as e:
-        logging.error(f"ImageGeneration create exception: {e}")
-        return None
+
+    # Попытки с повторным запросом при DNS-ошибке
+    for attempt in range(2):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code != 200:
+                logging.error(f"ImageGeneration create error: {resp.status_code} {resp.text}")
+                return None
+            operation_id = resp.json().get("id")
+            if not operation_id:
+                return None
+            break
+        except requests.exceptions.RequestException as e:
+            logging.error(f"ImageGeneration create exception (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            else:
+                return None
 
     status_url = f"https://api.ai.yandex.net/art/v1/images/generation/{operation_id}"
     for _ in range(15):
@@ -331,6 +334,8 @@ def recognize_speech(file_content: bytes) -> str:
         if resp.status_code == 200:
             result = resp.json()
             return result.get("result", "Не удалось распознать речь")
+        elif resp.status_code == 401:
+            return "⚠️ Ошибка авторизации SpeechKit. Убедитесь, что сервисный аккаунт имеет роль `ai.speechkit-stt.user`."
         else:
             return f"Ошибка STT: {resp.status_code} - {resp.text}"
     except Exception as e:
@@ -495,7 +500,7 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         if img_data:
             send_telegram_photo(chat_id, img_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
         else:
-            reply = "⚠️ Не удалось сгенерировать изображение. Проверьте роль `ai.art.user` у сервисного аккаунта."
+            reply = "⚠️ Не удалось сгенерировать изображение. Возможные причины: недостаточно прав (роль `ai.art.user`) или временные проблемы с сервером."
         decrement_request(user_id)
         del user_states[user_id]
         send_main_keyboard(chat_id, "Что ещё сделать?")
@@ -563,7 +568,7 @@ def handle_media(update):
             if file_content:
                 send_telegram_message(chat_id, "🎤 Распознаю голосовое сообщение...")
                 recognized = recognize_speech(file_content)
-                if recognized and "Не удалось" not in recognized and "Ошибка" not in recognized:
+                if recognized and "Не удалось" not in recognized and "Ошибка" not in recognized and "авторизации" not in recognized:
                     send_telegram_message(chat_id, f"📝 *Распознанный текст:*\n{recognized}")
                     gpt_reply = call_yandexgpt("Ты полезный ассистент.", f"Ответь на голосовое сообщение: {recognized}")
                     send_telegram_message(chat_id, gpt_reply)

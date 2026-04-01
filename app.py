@@ -1,127 +1,113 @@
-# app.py
+# app.py (SQLite version with fixed callback handling)
 import os
 import logging
 import json
 import requests
+import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # ================== КОНФИГУРАЦИЯ ==================
-# Получаем переменные окружения (задаются в Railway)
 FOLDER_ID = os.environ.get('FOLDER_ID')
 API_KEY = os.environ.get('API_KEY')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_IDS = [int(id.strip()) for id in os.environ.get('ADMIN_IDS', '').split(',') if id.strip()]  # список ID через запятую
-DATABASE_URL = os.environ.get('DATABASE_URL')  # PostgreSQL URL от Railway
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set. Please add PostgreSQL plugin or set DATABASE_URL manually.")
+# ADMIN_IDS может быть строкой с числами через запятую
+ADMIN_IDS = [int(id.strip()) for id in os.environ.get('ADMIN_IDS', '').split(',') if id.strip()]
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 
-# ================== БАЗА ДАННЫХ (POSTGRESQL) ==================
+# ================== БАЗА ДАННЫХ (SQLITE) ==================
 def get_db_connection():
-    """Возвращает новое соединение с PostgreSQL"""
-    return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect('studyhelper.db')
 
 def init_db():
-    """Создаёт таблицы, если их нет"""
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    subscription_end DATE,
-                    requests_today INTEGER DEFAULT 0,
-                    last_request_date DATE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS queries (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    query_text TEXT,
-                    response_text TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS payments (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    amount INTEGER,
-                    payment_id TEXT,
-                    status TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                subscription_end DATE,
+                requests_today INTEGER DEFAULT 0,
+                last_request_date DATE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                query_text TEXT,
+                response_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount INTEGER,
+                payment_id TEXT,
+                status TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         conn.commit()
         logging.info("Database initialized")
 
-# Вызовем при старте
 init_db()
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def is_premium(user_id: int) -> bool:
-    """Проверка активной подписки"""
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
-            result = cur.fetchone()
-            if result and result[0]:
-                end_date = result[0]
-                return end_date >= datetime.now().date()
-            return False
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if result and result[0]:
+            end_date = datetime.strptime(result[0], '%Y-%m-%d').date()
+            return end_date >= datetime.now().date()
+        return False
 
 def increment_requests(user_id: int) -> int:
-    """Увеличивает счётчик запросов и возвращает текущее количество за сегодня"""
     today = datetime.now().date().isoformat()
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT requests_today, last_request_date FROM users WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            if row:
-                last_date = row[1]
-                if last_date != today:
-                    cur.execute("UPDATE users SET requests_today = 1, last_request_date = %s WHERE user_id = %s", (today, user_id))
-                    conn.commit()
-                    return 1
-                else:
-                    cur.execute("UPDATE users SET requests_today = requests_today + 1 WHERE user_id = %s", (user_id,))
-                    conn.commit()
-                    cur.execute("SELECT requests_today FROM users WHERE user_id = %s", (user_id,))
-                    count = cur.fetchone()[0]
-                    return count
-            else:
-                cur.execute("INSERT INTO users (user_id, requests_today, last_request_date) VALUES (%s, 1, %s)", (user_id, today))
+        cursor = conn.cursor()
+        cursor.execute("SELECT requests_today, last_request_date FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            if row[1] != today:
+                cursor.execute("UPDATE users SET requests_today = 1, last_request_date = ? WHERE user_id = ?", (today, user_id))
                 conn.commit()
                 return 1
+            else:
+                cursor.execute("UPDATE users SET requests_today = requests_today + 1 WHERE user_id = ?", (user_id,))
+                conn.commit()
+                cursor.execute("SELECT requests_today FROM users WHERE user_id = ?", (user_id,))
+                count = cursor.fetchone()[0]
+                return count
+        else:
+            cursor.execute("INSERT INTO users (user_id, requests_today, last_request_date) VALUES (?, 1, ?)", (user_id, today))
+            conn.commit()
+            return 1
 
 def can_make_request(user_id: int) -> bool:
-    """Проверяет, может ли пользователь сделать запрос (премиум или лимит 5 в день)"""
     if is_premium(user_id):
         return True
     return increment_requests(user_id) <= 5
 
 def save_query(user_id: int, query: str, response: str):
-    """Сохраняет запрос и ответ в историю"""
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO queries (user_id, query_text, response_text) VALUES (%s, %s, %s)",
-                        (user_id, query[:500], response[:500]))
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO queries (user_id, query_text, response_text) VALUES (?, ?, ?)",
+                       (user_id, query[:500], response[:500]))
         conn.commit()
 
 def send_telegram_message(chat_id: int, text: str, reply_markup=None):
-    """Отправляет сообщение в Telegram"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
@@ -130,7 +116,6 @@ def send_telegram_message(chat_id: int, text: str, reply_markup=None):
 
 # ================== YANDEXGPT ИНТЕГРАЦИЯ ==================
 def call_yandexgpt(system_prompt: str, user_message: str) -> str:
-    """Вызывает YandexGPT и возвращает ответ"""
     prompt = {
         "modelUri": f"gpt://{FOLDER_ID}/yandexgpt-lite",
         "completionOptions": {"stream": False, "temperature": 0.6, "maxTokens": 2000},
@@ -168,9 +153,15 @@ def explain_concept(concept: str) -> str:
 
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
 def handle_telegram_update(update):
-    """Основной обработчик обновлений от Telegram"""
+    # ** ВАЖНО: сначала обрабатываем callback-запросы (кнопки) **
+    if "callback_query" in update:
+        handle_callback(update["callback_query"])
+        return
+
+    # Если нет ни сообщения, ни callback — выходим
     if "message" not in update:
         return
+
     msg = update["message"]
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
@@ -180,9 +171,9 @@ def handle_telegram_update(update):
 
     # Регистрируем пользователя (если ещё нет)
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users (user_id, username, first_name) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
-                        (user_id, username, first_name))
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+                       (user_id, username, first_name))
         conn.commit()
 
     # Обработка команд
@@ -235,12 +226,7 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    # Обработка callback-запросов (кнопки)
-    if "callback_query" in update:
-        handle_callback(update["callback_query"])
-        return
-
-    # Обычное сообщение — считаем запросом к AI
+    # Обычное текстовое сообщение (не команда)
     if not can_make_request(user_id):
         send_telegram_message(chat_id,
                               "⚠️ Ты исчерпал лимит бесплатных запросов на сегодня.\n"
@@ -248,32 +234,26 @@ def handle_telegram_update(update):
                               "/premium")
         return
 
-    # Генерация ответа по умолчанию (можно расширить)
     system_prompt = "Ты полезный ассистент. Отвечай кратко и по делу."
     reply = call_yandexgpt(system_prompt, text)
     save_query(user_id, text, reply)
     send_telegram_message(chat_id, reply)
 
 def handle_callback(callback):
-    """Обрабатывает нажатия инлайн-кнопок"""
     chat_id = callback["message"]["chat"]["id"]
     user_id = callback["from"]["id"]
     data = callback["data"]
-    # Подтверждаем получение callback'а
+    # Обязательно отвечаем на callback, чтобы кнопка перестала грузиться
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
                   json={"callback_query_id": callback["id"]})
 
     if data == "conspect":
         send_telegram_message(chat_id, "📚 Отправь текст лекции или загрузи файл.")
-        # В реальном боте здесь нужно перевести пользователя в состояние ожидания текста
-        # Для упрощения оставим так, но пользователь должен будет написать текст вручную.
-        # В полноценной версии используйте FSM (например, через хранение состояния в БД).
     elif data == "test":
         send_telegram_message(chat_id, "📝 Напиши тему, по которой создать тест.")
     elif data == "explain":
         send_telegram_message(chat_id, "🔍 Напиши понятие, которое нужно объяснить.")
     elif data == "premium" or data == "buy_premium":
-        # Здесь должна быть ссылка на ваш платёжный сервис (Tilda, ЮKassa и т.п.)
         payment_link = f"https://your-tilda-site.ru/payment?user_id={user_id}"
         kb = {"inline_keyboard": [[{"text": "💳 Оплатить 150 руб", "url": payment_link}]]}
         send_telegram_message(chat_id,
@@ -283,7 +263,7 @@ def handle_callback(callback):
                               "🔗 Нажми на кнопку ниже:",
                               json.dumps(kb))
     elif data == "referral":
-        ref_link = f"https://t.me/StudyHelperBot?start=ref_{user_id}"
+        ref_link = f"https://t.me/unistudyhelper_bot?start=ref_{user_id}"
         send_telegram_message(chat_id,
                               f"🎁 **Реферальная программа**\n\n"
                               f"Твоя ссылка:\n`{ref_link}`\n\n"
@@ -292,7 +272,6 @@ def handle_callback(callback):
 # ================== HTTP ENDPOINTS ==================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Эндпоинт для Telegram вебхука"""
     update = request.get_json()
     logging.info(f"Received update: {update}")
     handle_telegram_update(update)
@@ -300,7 +279,6 @@ def webhook():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Оставлен для совместимости с предыдущим интерфейсом (прямой вызов)"""
     data = request.get_json()
     user_msg = data.get('message', '').strip()
     if not user_msg:
@@ -310,10 +288,6 @@ def chat():
 
 @app.route('/payment-webhook', methods=['POST'])
 def payment_webhook():
-    """
-    Принимает уведомления от платёжного конструктора.
-    Ожидает JSON: {"user_id": 123, "payment_id": "xxx", "amount": 150, "status": "paid"}
-    """
     data = request.get_json()
     user_id = data.get('user_id')
     payment_id = data.get('payment_id')
@@ -323,10 +297,10 @@ def payment_webhook():
     if status == 'paid' and user_id:
         end_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
         with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (end_date, user_id))
-                cur.execute("INSERT INTO payments (user_id, amount, payment_id, status) VALUES (%s, %s, %s, %s)",
-                            (user_id, amount, payment_id, status))
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (end_date, user_id))
+            cursor.execute("INSERT INTO payments (user_id, amount, payment_id, status) VALUES (?, ?, ?, ?)",
+                           (user_id, amount, payment_id, status))
             conn.commit()
         send_telegram_message(user_id, f"✅ Оплата подтверждена! Подписка активна до {end_date}")
         return jsonify({"status": "ok"}), 200
@@ -335,6 +309,5 @@ def payment_webhook():
 
 # ================== ЗАПУСК ==================
 if __name__ == '__main__':
-    # Для локального запуска или если не используется gunicorn
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)

@@ -1,10 +1,11 @@
-# app.py (расширенный функционал: OCR, описание картинок, умный диалог)
+# app.py (финальная версия)
 import os
 import logging
 import json
 import requests
 import sqlite3
 import base64
+import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,7 +21,7 @@ app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 
-# ================== БАЗА ДАННЫХ ==================
+# ================== БАЗА ДАННЫХ (SQLITE) ==================
 def get_db_connection():
     return sqlite3.connect('studyhelper.db')
 
@@ -56,14 +57,6 @@ def init_db():
                 payment_id TEXT,
                 plan_type TEXT,
                 status TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS dialog_history (
-                user_id INTEGER,
-                role TEXT,
-                text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -117,6 +110,7 @@ def refresh_free_requests(user_id: int):
 def can_make_request(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
+
     user = get_user_info(user_id)
     if not user:
         with get_db_connection() as conn:
@@ -125,6 +119,7 @@ def can_make_request(user_id: int) -> bool:
                            (user_id, datetime.now().date().isoformat()))
             conn.commit()
         return True
+
     if user["type"] != "free":
         if user["end_date"] and user["end_date"] >= datetime.now().date().isoformat():
             return user["remaining"] > 0
@@ -135,11 +130,14 @@ def can_make_request(user_id: int) -> bool:
                                (datetime.now().date().isoformat(), user_id))
                 conn.commit()
             return True
+
     refresh_free_requests(user_id)
     user = get_user_info(user_id)
     return user["remaining"] > 0
 
 def decrement_request(user_id: int):
+    if user_id in ADMIN_IDS:
+        return
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET requests_remaining = requests_remaining - 1 WHERE user_id = ?", (user_id,))
@@ -159,9 +157,15 @@ def send_telegram_message(chat_id: int, text: str, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(url, json=payload)
 
-def send_telegram_photo(chat_id: int, photo_file_id: str, caption: str = ""):
+def send_telegram_photo(chat_id: int, photo_data: bytes, caption: str = ""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {"chat_id": chat_id, "photo": photo_file_id, "caption": caption, "parse_mode": "Markdown"}
+    files = {"photo": photo_data}
+    data = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
+    requests.post(url, data=data, files=files)
+
+def send_telegram_voice(chat_id: int, file_id: str, caption: str = ""):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVoice"
+    payload = {"chat_id": chat_id, "voice": file_id, "caption": caption, "parse_mode": "Markdown"}
     requests.post(url, json=payload)
 
 def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню"):
@@ -169,9 +173,9 @@ def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню")
         "keyboard": [
             ["📝 Пересказать текст", "📝 Создать тест"],
             ["🔍 Объяснить понятие", "✍️ Написать эссе"],
-            ["🔢 Реши задачу", "⭐ Премиум"],
-            ["📷 Распознать текст", "🖼 Описать картинку"],
-            ["💬 Умный диалог", "🎁 Рефералка"]
+            ["🔢 Реши задачу", "📷 Распознать текст"],
+            ["🎨 Сгенерировать изображение", "🎤 Распознать голос"],
+            ["⭐ Премиум", "🎁 Рефералка"]
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False
@@ -182,21 +186,17 @@ def remove_keyboard(chat_id: int, text: str):
     markup = {"remove_keyboard": True}
     send_telegram_message(chat_id, text, json.dumps(markup))
 
-# ================== YANDEXGPT ИНТЕГРАЦИЯ ==================
-def call_yandexgpt(system_prompt: str, user_message: str, messages_history=None) -> str:
+# ================== YANDEXGPT (languageModels) ==================
+def call_yandexgpt(system_prompt: str, user_message: str) -> str:
     if len(user_message) > 3000:
         user_message = user_message[:3000] + "…"
-    # Для простого диалога (без истории) формируем стандартный запрос
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "text": system_prompt[:1000]})
-    if messages_history:
-        messages.extend(messages_history[-10:])  # последние 10 сообщений
-    messages.append({"role": "user", "text": user_message})
     prompt = {
         "modelUri": f"gpt://{FOLDER_ID}/yandexgpt-lite",
         "completionOptions": {"stream": False, "temperature": 0.6, "maxTokens": 2000},
-        "messages": messages
+        "messages": [
+            {"role": "system", "text": system_prompt[:1000]},
+            {"role": "user", "text": user_message}
+        ]
     }
     try:
         resp = requests.post(
@@ -234,84 +234,116 @@ def solve_task(problem: str) -> str:
     system = "Ты — эксперт по решению задач. Помоги пользователю решить задачу шаг за шагом."
     return call_yandexgpt(system, f"Реши задачу:\n{problem}")
 
-# ================== YANDEX VISION (OCR, описание) ==================
-def vision_ocr(file_id: str) -> str:
-    """Распознаёт текст на изображении через Yandex Vision"""
-    # Получаем ссылку на файл от Telegram
-    file_info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id}).json()
-    if not file_info.get("ok"):
-        return "Не удалось получить файл."
-    file_path = file_info["result"]["file_path"]
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    # Скачиваем изображение
-    img_data = requests.get(file_url).content
-    # Кодируем в base64
-    img_base64 = base64.b64encode(img_data).decode('utf-8')
-    # Формируем запрос к Vision OCR
+# ================== YANDEX VISION (распознавание текста на фото) ==================
+def recognize_image(file_content: bytes) -> str:
     url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
-    headers = {"Authorization": f"Api-Key {API_KEY}", "Content-Type": "application/json"}
-    payload = {
+    headers = {
+        "Authorization": f"Api-Key {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    img_base64 = base64.b64encode(file_content).decode('utf-8')
+    body = {
+        "folderId": FOLDER_ID,
         "analyze_specs": [{
             "content": img_base64,
-            "features": [{"type": "TEXT_DETECTION"}]
+            "features": [{
+                "type": "TEXT_DETECTION",
+                "text_detection_config": {"language_codes": ["ru", "en"]}
+            }]
         }]
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
-            return f"Ошибка Vision API: {resp.status_code}"
-        data = resp.json()
-        # Извлекаем текст
-        text_blocks = data.get("results", [{}])[0].get("textDetection", {}).get("pages", [{}])[0].get("blocks", [])
-        if not text_blocks:
-            return "Текст не найден на изображении."
-        full_text = "\n".join([block.get("text", "") for block in text_blocks if block.get("text")])
-        return full_text.strip() or "Текст не распознан."
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        logging.info(f"Vision status: {resp.status_code}, body: {resp.text[:500]}")
+        if resp.status_code == 200:
+            data = resp.json()
+            text_blocks = []
+            for result in data.get("results", []):
+                for text_annotation in result.get("textDetection", []):
+                    text_blocks.append(text_annotation.get("text", ""))
+            if text_blocks:
+                return "\n".join(text_blocks)
+            else:
+                return "На изображении не найден текст."
+        else:
+            return f"Ошибка Vision API: {resp.status_code} - {resp.text}"
     except Exception as e:
-        logging.error(f"Vision OCR error: {e}")
-        return f"Ошибка: {e}"
+        logging.error(f"Vision error: {e}")
+        return "⚠️ Не удалось распознать изображение."
 
-def vision_classify(file_id: str) -> str:
-    """Классифицирует содержимое изображения (общий анализ)"""
-    file_info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id}).json()
-    if not file_info.get("ok"):
-        return "Не удалось получить файл."
-    file_path = file_info["result"]["file_path"]
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    img_data = requests.get(file_url).content
-    img_base64 = base64.b64encode(img_data).decode('utf-8')
-    url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
-    headers = {"Authorization": f"Api-Key {API_KEY}", "Content-Type": "application/json"}
+# ================== YANDEXART (генерация изображений) ==================
+def generate_image(prompt: str) -> bytes:
+    url = "https://api.ai.yandex.net/art/v1/images/generation"
+    headers = {
+        "Authorization": f"Api-Key {API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "analyze_specs": [{
-            "content": img_base64,
-            "features": [{"type": "CLASSIFICATION", "classificationModels": {"model": "image"} }]
-        }]
+        "modelUri": f"art://{FOLDER_ID}/yandex-art/latest",
+        "generationOptions": {"seed": 0},
+        "messages": [{"role": "user", "text": prompt}]
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
-            return f"Ошибка Vision API: {resp.status_code}"
-        data = resp.json()
-        # Парсим классификацию
-        classification = data.get("results", [{}])[0].get("classification", {})
-        categories = classification.get("properties", [])
-        if not categories:
-            return "Не удалось определить содержимое."
-        top_cat = categories[0].get("name", "неизвестно")
-        confidence = categories[0].get("probability", 0)
-        return f"На изображении, вероятно, {top_cat} (уверенность {round(confidence*100)}%)."
+            logging.error(f"ImageGeneration create error: {resp.status_code} {resp.text}")
+            return None
+        operation_id = resp.json().get("id")
+        if not operation_id:
+            return None
     except Exception as e:
-        logging.error(f"Vision classification error: {e}")
-        return f"Ошибка: {e}"
+        logging.error(f"ImageGeneration create exception: {e}")
+        return None
+
+    status_url = f"https://api.ai.yandex.net/art/v1/images/generation/{operation_id}"
+    for _ in range(15):
+        time.sleep(2)
+        try:
+            status_resp = requests.get(status_url, headers=headers, timeout=10)
+            if status_resp.status_code != 200:
+                continue
+            data = status_resp.json()
+            if data.get("done"):
+                image_base64 = data.get("response", {}).get("image")
+                if image_base64:
+                    return base64.b64decode(image_base64)
+                else:
+                    return None
+        except Exception as e:
+            logging.error(f"ImageGeneration status check error: {e}")
+            continue
+    return None
+
+# ================== YANDEX SPEECHKIT STT (распознавание речи) ==================
+def recognize_speech(file_content: bytes) -> str:
+    url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+    headers = {
+        "Authorization": f"Api-Key {API_KEY}"
+    }
+    params = {
+        "folderId": FOLDER_ID,
+        "lang": "ru-RU",
+        "format": "oggopus"
+    }
+    try:
+        resp = requests.post(url, headers=headers, params=params, data=file_content, timeout=30)
+        logging.info(f"STT status: {resp.status_code}, body: {resp.text[:500]}")
+        if resp.status_code == 200:
+            result = resp.json()
+            return result.get("result", "Не удалось распознать речь")
+        else:
+            return f"Ошибка STT: {resp.status_code} - {resp.text}"
+    except Exception as e:
+        logging.error(f"STT error: {e}")
+        return "⚠️ Не удалось распознать голос."
 
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
 user_states = {}
-dialog_context = {}  # храним историю диалога для умного режима
 
 def handle_telegram_update(update):
     if "message" not in update:
         return
+
     msg = update["message"]
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
@@ -319,21 +351,17 @@ def handle_telegram_update(update):
     first_name = msg["from"].get("first_name", "")
     username = msg["from"].get("username", "")
 
+    # Регистрация
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
                        (user_id, username, first_name))
         conn.commit()
 
-    # Проверка активного состояния (например, ожидание текста)
+    # Состояние
     state = user_states.get(user_id)
     if state:
         handle_state_input(user_id, chat_id, text, state)
-        return
-
-    # Обработка фото
-    if "photo" in msg:
-        handle_photo(user_id, chat_id, msg["photo"][-1]["file_id"])
         return
 
     # Команды
@@ -362,7 +390,7 @@ def handle_telegram_update(update):
                               "/help — Эта справка\n\n"
                               "**Как пользоваться:**\n"
                               "1. Нажми на кнопку внизу\n"
-                              "2. Введи текст или загрузи фото\n"
+                              "2. Введи текст, загрузи фото или отправь голосовое\n"
                               "3. Получи ответ от AI")
         return
 
@@ -382,15 +410,16 @@ def handle_telegram_update(update):
                               "🌟 **Выберите тариф подписки:**\n\n"
                               "💎 **Премиум** – 250 запросов/мес, 150 руб\n"
                               "💎 **Премиум+** – 500 запросов/мес, 300 руб\n\n"
-                              "Оплата производится через платёжную систему. После оплаты подписка активируется автоматически.",
+                              "Оплата производится через платёжную систему.",
                               json.dumps(kb))
         return
 
-    # Кнопки обычной клавиатуры
+    # Обработка кнопок (включая новую "📷 Распознать текст")
     if text in ["📝 Пересказать текст", "📝 Создать тест", "🔍 Объяснить понятие",
-                "✍️ Написать эссе", "🔢 Реши задачу", "💬 Умный диалог"]:
+                "✍️ Написать эссе", "🔢 Реши задачу", "🎨 Сгенерировать изображение",
+                "📷 Распознать текст", "🖼 Распознать изображение"]:
         if not can_make_request(user_id):
-            send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. Приобретите подписку: /premium")
+            send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
             return
         mapping = {
             "📝 Пересказать текст": "summarize",
@@ -398,35 +427,29 @@ def handle_telegram_update(update):
             "🔍 Объяснить понятие": "explain",
             "✍️ Написать эссе": "essay",
             "🔢 Реши задачу": "solve_task",
-            "💬 Умный диалог": "smart_dialog"
+            "🎨 Сгенерировать изображение": "generate_image",
+            "📷 Распознать текст": "recognize_image",
+            "🖼 Распознать изображение": "recognize_image"
         }
         state = mapping[text]
         prompts = {
-            "summarize": "📄 Отправь текст, который нужно пересказать.",
-            "test": "📝 Напиши тему, по которой создать тест.",
-            "explain": "🔍 Напиши понятие, которое нужно объяснить.",
+            "summarize": "📄 Отправь текст для пересказа.",
+            "test": "📝 Напиши тему теста.",
+            "explain": "🔍 Напиши понятие для объяснения.",
             "essay": "✍️ Напиши тему эссе.",
             "solve_task": "🔢 Напиши условие задачи.",
-            "smart_dialog": "💬 Включён режим умного диалога. Отправляй сообщения, я помню контекст. Напиши /stop, чтобы выйти."
+            "generate_image": "🎨 Напиши описание для изображения.",
+            "recognize_image": "🖼 Отправьте изображение для распознавания текста."
         }
         remove_keyboard(chat_id, prompts[state])
         user_states[user_id] = state
 
-    elif text in ["📷 Распознать текст", "🖼 Описать картинку"]:
+    elif text == "🎤 Распознать голос":
         if not can_make_request(user_id):
             send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
             return
-        mapping = {
-            "📷 Распознать текст": "ocr",
-            "🖼 Описать картинку": "classify"
-        }
-        state = mapping[text]
-        prompts = {
-            "ocr": "📷 Отправь фото, чтобы я распознал текст.",
-            "classify": "🖼 Отправь фото, я опишу, что на нём изображено."
-        }
-        remove_keyboard(chat_id, prompts[state])
-        user_states[user_id] = state
+        remove_keyboard(chat_id, "🎤 Отправьте голосовое сообщение.")
+        user_states[user_id] = "recognize_voice"
 
     elif text == "⭐ Премиум":
         kb = {
@@ -448,36 +471,6 @@ def handle_telegram_update(update):
                               "Пожалуйста, используй кнопки внизу или команды.\n"
                               "Если клавиатура не отображается, нажми /start")
 
-def handle_photo(user_id: int, chat_id: int, file_id: str):
-    """Обрабатывает фото, если пользователь в состоянии OCR или классификации"""
-    state = user_states.get(user_id)
-    if state not in ["ocr", "classify"]:
-        send_telegram_message(chat_id, "Сначала выбери функцию (Распознать текст или Описать картинку).")
-        return
-    if not can_make_request(user_id):
-        send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
-        del user_states[user_id]
-        send_main_keyboard(chat_id, "Главное меню:")
-        return
-
-    send_telegram_message(chat_id, "🔄 Обрабатываю изображение...")
-    if state == "ocr":
-        result = vision_ocr(file_id)
-    else:
-        result = vision_classify(file_id)
-
-    if result:
-        save_query(user_id, f"[фото] {state}", result)
-        send_telegram_message(chat_id, result)
-    else:
-        send_telegram_message(chat_id, "Не удалось обработать изображение.")
-
-    # Уменьшаем счётчик
-    if user_id not in ADMIN_IDS:
-        decrement_request(user_id)
-    del user_states[user_id]
-    send_main_keyboard(chat_id, "Что ещё сделать?")
-
 def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
     if not can_make_request(user_id):
         send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
@@ -485,35 +478,6 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         send_main_keyboard(chat_id, "Главное меню:")
         return
 
-    if state == "smart_dialog":
-        # Умный диалог с памятью
-        # Получаем историю из БД
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT role, text FROM dialog_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 20", (user_id,))
-            rows = cursor.fetchall()
-            history = [{"role": r[0], "text": r[1]} for r in reversed(rows)]  # хронологический порядок
-        # Добавляем новое сообщение
-        history.append({"role": "user", "text": text})
-        # Генерируем ответ
-        reply = call_yandexgpt("", "", messages_history=history)
-        # Сохраняем в БД
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO dialog_history (user_id, role, text) VALUES (?, 'user', ?)", (user_id, text))
-            cursor.execute("INSERT INTO dialog_history (user_id, role, text) VALUES (?, 'assistant', ?)", (user_id, reply))
-            # Очищаем старую историю, оставляя последние 30 сообщений
-            cursor.execute("DELETE FROM dialog_history WHERE user_id = ? AND created_at < (SELECT created_at FROM dialog_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 30 OFFSET 29)", (user_id, user_id))
-            conn.commit()
-        send_telegram_message(chat_id, reply)
-        # Не выходим из состояния, чтобы можно было продолжить диалог
-        # Обработка команды /stop
-        if text.lower() == "/stop":
-            del user_states[user_id]
-            send_main_keyboard(chat_id, "Режим умного диалога завершён. Возвращаем главное меню.")
-        return
-
-    # Обычные текстовые функции
     reply = None
     if state == "summarize":
         reply = summarize_text(text)
@@ -525,20 +489,113 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         reply = generate_essay(text)
     elif state == "solve_task":
         reply = solve_task(text)
+    elif state == "generate_image":
+        send_telegram_message(chat_id, "🎨 Генерирую изображение, это займёт до 15 секунд...")
+        img_data = generate_image(text)
+        if img_data:
+            send_telegram_photo(chat_id, img_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
+        else:
+            reply = "⚠️ Не удалось сгенерировать изображение. Проверьте роль `ai.art.user` у сервисного аккаунта."
+        decrement_request(user_id)
+        del user_states[user_id]
+        send_main_keyboard(chat_id, "Что ещё сделать?")
+        return
     else:
-        reply = "Неизвестное действие."
+        # Медиа обрабатываются отдельно в handle_media
+        send_telegram_message(chat_id, "Пожалуйста, используйте кнопки для выбора действия.")
+        del user_states[user_id]
+        send_main_keyboard(chat_id)
+        return
 
     if reply:
         save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
-
-    # Уменьшаем счётчик
-    if user_id not in ADMIN_IDS:
-        decrement_request(user_id)
+    decrement_request(user_id)
     del user_states[user_id]
     send_main_keyboard(chat_id, "Что ещё сделать?")
 
-# ================== CALLBACK-ОБРАБОТЧИКИ (инлайн-кнопки) ==================
+def handle_media(update):
+    """Обработка фото и голосовых сообщений"""
+    if "message" not in update:
+        return
+    msg = update["message"]
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    state = user_states.get(user_id)
+
+    # Фото
+    if state == "recognize_image" and "photo" in msg:
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
+            del user_states[user_id]
+            send_main_keyboard(chat_id, "Главное меню:")
+            return
+
+        file_id = msg["photo"][-1]["file_id"]
+        file_info = get_file(file_id)
+        if file_info:
+            file_content = download_file(file_info["file_path"])
+            if file_content:
+                send_telegram_message(chat_id, "🖼 Распознаю текст на изображении...")
+                recognized = recognize_image(file_content)
+                send_telegram_message(chat_id, f"📝 *Распознанный текст:*\n{recognized}")
+                save_query(user_id, "Распознавание изображения", recognized)
+                decrement_request(user_id)
+            else:
+                send_telegram_message(chat_id, "⚠️ Не удалось загрузить изображение.")
+        else:
+            send_telegram_message(chat_id, "⚠️ Не удалось получить файл.")
+        del user_states[user_id]
+        send_main_keyboard(chat_id, "Что ещё сделать?")
+
+    # Голосовое
+    elif state == "recognize_voice" and "voice" in msg:
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
+            del user_states[user_id]
+            send_main_keyboard(chat_id, "Главное меню:")
+            return
+
+        file_id = msg["voice"]["file_id"]
+        file_info = get_file(file_id)
+        if file_info:
+            file_content = download_file(file_info["file_path"])
+            if file_content:
+                send_telegram_message(chat_id, "🎤 Распознаю голосовое сообщение...")
+                recognized = recognize_speech(file_content)
+                if recognized and "Не удалось" not in recognized and "Ошибка" not in recognized:
+                    send_telegram_message(chat_id, f"📝 *Распознанный текст:*\n{recognized}")
+                    gpt_reply = call_yandexgpt("Ты полезный ассистент.", f"Ответь на голосовое сообщение: {recognized}")
+                    send_telegram_message(chat_id, gpt_reply)
+                    save_query(user_id, f"Голосовое: {recognized}", gpt_reply)
+                else:
+                    send_telegram_message(chat_id, recognized)
+                    save_query(user_id, "Голосовое сообщение", recognized)
+                decrement_request(user_id)
+            else:
+                send_telegram_message(chat_id, "⚠️ Не удалось загрузить голосовое сообщение.")
+        else:
+            send_telegram_message(chat_id, "⚠️ Не удалось получить файл.")
+        del user_states[user_id]
+        send_main_keyboard(chat_id, "Что ещё сделать?")
+
+def get_file(file_id: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+    resp = requests.get(url, params={"file_id": file_id})
+    if resp.status_code == 200:
+        data = resp.json()
+        if data["ok"]:
+            return data["result"]
+    return None
+
+def download_file(file_path: str):
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        return resp.content
+    return None
+
+# ================== CALLBACK-ОБРАБОТЧИКИ ==================
 def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
     user_id = callback["from"]["id"]
@@ -582,6 +639,9 @@ def webhook():
     if "callback_query" in update:
         handle_callback(update["callback_query"])
     else:
+        # Сначала обрабатываем медиа (фото/голос)
+        handle_media(update)
+        # Затем текстовые сообщения (кнопки, команды)
         handle_telegram_update(update)
     return "OK", 200
 

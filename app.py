@@ -1,4 +1,4 @@
-# app.py (финальный)
+# app.py (с ReplyKeyboardMarkup)
 import os
 import logging
 import json
@@ -119,6 +119,24 @@ def send_telegram_message(chat_id: int, text: str, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(url, json=payload)
 
+def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню"):
+    """Отправляет сообщение с обычной клавиатурой (ReplyKeyboardMarkup)"""
+    keyboard = {
+        "keyboard": [
+            ["📝 Пересказать текст", "📝 Создать тест"],
+            ["🔍 Объяснить понятие", "✍️ Написать эссе"],
+            ["⭐ Премиум", "🎁 Рефералка"]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+    send_telegram_message(chat_id, text, json.dumps(keyboard))
+
+def remove_keyboard(chat_id: int, text: str):
+    """Убирает клавиатуру (например, перед ожиданием ввода)"""
+    markup = {"remove_keyboard": True}
+    send_telegram_message(chat_id, text, json.dumps(markup))
+
 # ================== YANDEXGPT ИНТЕГРАЦИЯ ==================
 def call_yandexgpt(system_prompt: str, user_message: str) -> str:
     if len(user_message) > 3000:
@@ -164,29 +182,17 @@ def generate_essay(topic: str) -> str:
     return call_yandexgpt(system, f"Напиши эссе на тему: {topic}")
 
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
-def get_main_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-            [{"text": "📝 Создать тест", "callback_data": "test"}],
-            [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-            [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-            [{"text": "⭐ Премиум", "callback_data": "premium"}]
-        ]
-    }
+# Словарь для хранения состояний пользователей
+user_states = {}
 
 def handle_telegram_update(update):
-    if "callback_query" in update:
-        handle_callback(update["callback_query"])
-        return
-
     if "message" not in update:
         return
 
     msg = update["message"]
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
-    text = msg.get("text", "")
+    text = msg.get("text", "").strip()
     first_name = msg["from"].get("first_name", "")
     username = msg["from"].get("username", "")
 
@@ -197,16 +203,22 @@ def handle_telegram_update(update):
                        (user_id, username, first_name))
         conn.commit()
 
-    # Команды
+    # Если есть активное состояние (ожидание ввода)
+    state = user_states.get(user_id)
+    if state:
+        # Если пользователь ввёл текст, обрабатываем
+        handle_state_input(user_id, chat_id, text, state)
+        return
+
+    # Иначе обрабатываем команды и кнопки
     if text == "/start":
         premium_status = "✅ Бессрочно (админ)" if user_id in ADMIN_IDS else ("✅ Активна" if is_premium(user_id) else "❌ Неактивна")
-        send_telegram_message(chat_id,
-                              f"🎓 Привет, {first_name}!\n\n"
-                              f"Я StudyHelperBot — твой AI-ассистент для учёбы.\n\n"
-                              f"📊 Статус: Премиум {premium_status}\n"
-                              f"🔓 Бесплатно: 5 запросов/день (для админа безлимит)\n\n"
-                              f"Выбери действие:",
-                              json.dumps(get_main_keyboard()))
+        send_main_keyboard(chat_id,
+                           f"🎓 Привет, {first_name}!\n\n"
+                           f"Я StudyHelperBot — твой AI-ассистент для учёбы.\n\n"
+                           f"📊 Статус: Премиум {premium_status}\n"
+                           f"🔓 Бесплатно: 5 запросов/день (для админа безлимит)\n\n"
+                           f"Выбери действие:")
         return
 
     elif text == "/help":
@@ -217,9 +229,13 @@ def handle_telegram_update(update):
                               "/premium — Подписка\n"
                               "/help — Эта справка\n\n"
                               "**Как пользоваться:**\n"
-                              "1. Напиши /start или /menu\n"
-                              "2. Выбери действие из кнопок\n"
-                              "3. Введи текст (тему или сам текст) и получи ответ от AI")
+                              "1. Нажми на кнопку внизу\n"
+                              "2. Введи текст или тему\n"
+                              "3. Получи ответ от AI")
+        return
+
+    elif text == "/menu" or text == "Меню" or text == "меню":
+        send_main_keyboard(chat_id, "📋 Главное меню:")
         return
 
     elif text == "/premium":
@@ -239,60 +255,40 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    elif text == "/menu" or text.lower() == "меню":
-        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
-        return
+    # Обработка кнопок обычной клавиатуры
+    elif text == "📝 Пересказать текст":
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id,
+                                  "⚠️ Ты исчерпал лимит бесплатных запросов на сегодня.\n"
+                                  "Оформи премиум за 150 руб/мес для безлимита!\n"
+                                  "/premium")
+            return
+        remove_keyboard(chat_id, "📄 Отправь текст, который нужно пересказать.")
+        user_states[user_id] = "summarize"
 
-    # Обычное сообщение (не команда)
-    if not can_make_request(user_id):
-        send_telegram_message(chat_id,
-                              "⚠️ Ты исчерпал лимит бесплатных запросов на сегодня.\n"
-                              "Оформи премиум за 150 руб/мес для безлимита!\n"
-                              "/premium")
-        return
+    elif text == "📝 Создать тест":
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id, "⚠️ Лимит исчерпан. /premium")
+            return
+        remove_keyboard(chat_id, "📝 Напиши тему, по которой создать тест.")
+        user_states[user_id] = "test"
 
-    # Если нет состояния – напоминаем
-    send_telegram_message(chat_id,
-                          "Сначала выбери действие, нажав на кнопку в меню.\n"
-                          "Если меню не видно, напиши /menu")
+    elif text == "🔍 Объяснить понятие":
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id, "⚠️ Лимит исчерпан. /premium")
+            return
+        remove_keyboard(chat_id, "🔍 Напиши понятие, которое нужно объяснить.")
+        user_states[user_id] = "explain"
 
-def handle_callback(callback):
-    chat_id = callback["message"]["chat"]["id"]
-    user_id = callback["from"]["id"]
-    data = callback["data"]
-    # Отвечаем на callback, чтобы кнопка перестала крутиться
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-                  json={"callback_query_id": callback["id"]})
+    elif text == "✍️ Написать эссе":
+        if not can_make_request(user_id):
+            send_telegram_message(chat_id, "⚠️ Лимит исчерпан. /premium")
+            return
+        remove_keyboard(chat_id, "✍️ Напиши тему эссе.")
+        user_states[user_id] = "essay"
 
-    if data == "summarize":
-        send_telegram_message(chat_id, "📄 Отправь текст, который нужно пересказать.")
-        if not hasattr(handle_callback, 'user_states'):
-            handle_callback.user_states = {}
-        handle_callback.user_states[user_id] = "summarize"
-        return
-
-    elif data == "test":
-        send_telegram_message(chat_id, "📝 Напиши тему, по которой создать тест.")
-        if not hasattr(handle_callback, 'user_states'):
-            handle_callback.user_states = {}
-        handle_callback.user_states[user_id] = "test"
-        return
-
-    elif data == "explain":
-        send_telegram_message(chat_id, "🔍 Напиши понятие, которое нужно объяснить.")
-        if not hasattr(handle_callback, 'user_states'):
-            handle_callback.user_states = {}
-        handle_callback.user_states[user_id] = "explain"
-        return
-
-    elif data == "essay":
-        send_telegram_message(chat_id, "✍️ Напиши тему эссе.")
-        if not hasattr(handle_callback, 'user_states'):
-            handle_callback.user_states = {}
-        handle_callback.user_states[user_id] = "essay"
-        return
-
-    elif data == "premium" or data == "buy_premium":
+    elif text == "⭐ Премиум":
+        # Отправим инлайн-кнопки с оплатой
         payment_link = f"https://your-tilda-site.ru/payment?user_id={user_id}"
         kb = {"inline_keyboard": [[{"text": "💳 Оплатить 150 руб", "url": payment_link}]]}
         send_telegram_message(chat_id,
@@ -301,79 +297,49 @@ def handle_callback(callback):
                               "После оплаты подписка активируется автоматически.\n"
                               "🔗 Нажми на кнопку ниже:",
                               json.dumps(kb))
-        # Вернём главное меню
-        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
-        return
 
-    elif data == "referral":
+    elif text == "🎁 Рефералка":
         ref_link = f"https://t.me/unistudyhelper_bot?start=ref_{user_id}"
         send_telegram_message(chat_id,
                               f"🎁 **Реферальная программа**\n\n"
                               f"Твоя ссылка:\n`{ref_link}`\n\n"
                               "Приведи друга — получи скидку 20% на следующий месяц!")
-        # Вернём главное меню
-        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
-        return
 
-# ================== ОБРАБОТКА СООБЩЕНИЙ С УЧЁТОМ СОСТОЯНИЯ ==================
-def handle_text_message(user_id, chat_id, text):
-    if not hasattr(handle_callback, 'user_states'):
-        handle_callback.user_states = {}
-    state = handle_callback.user_states.get(user_id)
+    else:
+        # Неизвестная команда
+        send_telegram_message(chat_id,
+                              "Пожалуйста, используй кнопки внизу или команды.\n"
+                              "Если клавиатура не отображается, нажми /start")
 
+def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
+    # Обрабатываем ввод пользователя в зависимости от состояния
+    reply = ""
     if state == "summarize":
         reply = summarize_text(text)
         save_query(user_id, text, reply)
-        send_telegram_message(chat_id, reply)
-        del handle_callback.user_states[user_id]
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
-
     elif state == "test":
         reply = generate_test(text)
         save_query(user_id, text, reply)
-        send_telegram_message(chat_id, reply)
-        del handle_callback.user_states[user_id]
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
-
     elif state == "explain":
         reply = explain_concept(text)
         save_query(user_id, text, reply)
-        send_telegram_message(chat_id, reply)
-        del handle_callback.user_states[user_id]
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
-
     elif state == "essay":
         reply = generate_essay(text)
         save_query(user_id, text, reply)
-        send_telegram_message(chat_id, reply)
-        del handle_callback.user_states[user_id]
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
 
-    else:
-        send_telegram_message(chat_id,
-                              "Сначала выбери действие, нажав на кнопку в меню.\n"
-                              "Если меню не видно, напиши /menu")
+    # Отправляем ответ
+    send_telegram_message(chat_id, reply)
+
+    # Сбрасываем состояние и возвращаем клавиатуру
+    del user_states[user_id]
+    send_main_keyboard(chat_id, "Что ещё сделать?")
 
 # ================== ВЕБХУК ==================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     update = request.get_json()
     logging.info(f"Received update: {update}")
-
-    if "callback_query" in update:
-        handle_callback(update["callback_query"])
-        return "OK", 200
-
-    if "message" in update:
-        msg = update["message"]
-        chat_id = msg["chat"]["id"]
-        user_id = msg["from"]["id"]
-        text = msg.get("text", "")
-        if text.startswith('/'):
-            handle_telegram_update(update)
-        else:
-            handle_text_message(user_id, chat_id, text)
-
+    handle_telegram_update(update)
     return "OK", 200
 
 # ================== ДРУГИЕ ЭНДПОЙНТЫ ==================
@@ -403,6 +369,8 @@ def payment_webhook():
                            (user_id, amount, payment_id, status))
             conn.commit()
         send_telegram_message(user_id, f"✅ Оплата подтверждена! Подписка активна до {end_date}")
+        # Вернём клавиатуру
+        send_main_keyboard(user_id, "Теперь у вас премиум-доступ!")
         return jsonify({"status": "ok"}), 200
     else:
         return jsonify({"status": "error", "message": "Invalid payment data"}), 400

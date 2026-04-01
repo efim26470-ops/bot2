@@ -1,4 +1,4 @@
-# app.py (финальная версия)
+# app.py (финальная версия с исправленным URL для YandexART)
 import os
 import logging
 import json
@@ -267,7 +267,7 @@ def recognize_image(file_content: bytes) -> str:
         logging.error(f"Vision error: {e}")
         return "⚠️ Не удалось распознать изображение."
 
-# ================== YANDEXART (генерация изображений) с диагностикой DNS ==================
+# ================== YANDEXART (генерация изображений) с исправленным URL ==================
 def check_dns(hostname):
     try:
         socket.gethostbyname(hostname)
@@ -276,10 +276,10 @@ def check_dns(hostname):
         return False
 
 def generate_image(prompt: str) -> bytes:
-    # Предварительная проверка DNS
-    if not check_dns("api.ai.yandex.net"):
-        return None  # ошибка будет обработана в handle_state_input
-    url = "https://api.ai.yandex.net/art/v1/images/generation"
+    # Проверка DNS
+    if not check_dns("api.ai.cloud.yandex.net"):
+        return None
+    url = "https://api.ai.cloud.yandex.net/art/v1/images/generation"
     headers = {
         "Authorization": f"Api-Key {API_KEY}",
         "Content-Type": "application/json"
@@ -308,7 +308,7 @@ def generate_image(prompt: str) -> bytes:
             else:
                 return None
 
-    status_url = f"https://api.ai.yandex.net/art/v1/images/generation/{operation_id}"
+    status_url = f"https://api.ai.cloud.yandex.net/art/v1/images/generation/{operation_id}"
     for _ in range(15):
         time.sleep(2)
         try:
@@ -510,9 +510,8 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         if img_data:
             send_telegram_photo(chat_id, img_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
         else:
-            # Диагностика
-            if not check_dns("api.ai.yandex.net"):
-                reply = "⚠️ Не удалось подключиться к серверу YandexART. Проверьте доступность api.ai.yandex.net из вашего окружения Railway. Возможно, требуется добавить прокси или использовать другой хостинг."
+            if not check_dns("api.ai.cloud.yandex.net"):
+                reply = "⚠️ Не удалось подключиться к серверу YandexART. Проверьте доступность api.ai.cloud.yandex.net."
             else:
                 reply = "⚠️ Не удалось сгенерировать изображение. Возможные причины: недостаточно прав (роль `ai.art.user` у сервисного аккаунта) или временные проблемы с сервером."
         decrement_request(user_id)

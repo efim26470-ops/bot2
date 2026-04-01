@@ -1,4 +1,4 @@
-# app.py (с бесконечным премиум для админа)
+# app.py (финальный)
 import os
 import logging
 import json
@@ -63,7 +63,6 @@ init_db()
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def is_premium(user_id: int) -> bool:
-    # Администраторы всегда имеют премиум
     if user_id in ADMIN_IDS:
         return True
     with get_db_connection() as conn:
@@ -76,7 +75,6 @@ def is_premium(user_id: int) -> bool:
         return False
 
 def increment_requests(user_id: int) -> int:
-    # Для админов не считаем запросы
     if user_id in ADMIN_IDS:
         return 0
     today = datetime.now().date().isoformat()
@@ -101,7 +99,6 @@ def increment_requests(user_id: int) -> int:
             return 1
 
 def can_make_request(user_id: int) -> bool:
-    # Администраторам разрешено всё
     if user_id in ADMIN_IDS:
         return True
     if is_premium(user_id):
@@ -167,6 +164,17 @@ def generate_essay(topic: str) -> str:
     return call_yandexgpt(system, f"Напиши эссе на тему: {topic}")
 
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
+def get_main_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
+            [{"text": "📝 Создать тест", "callback_data": "test"}],
+            [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
+            [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
+            [{"text": "⭐ Премиум", "callback_data": "premium"}]
+        ]
+    }
+
 def handle_telegram_update(update):
     if "callback_query" in update:
         handle_callback(update["callback_query"])
@@ -191,39 +199,27 @@ def handle_telegram_update(update):
 
     # Команды
     if text == "/start":
-        kb = {
-            "inline_keyboard": [
-                [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-                [{"text": "📝 Создать тест", "callback_data": "test"}],
-                [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-                [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-                [{"text": "⭐ Премиум", "callback_data": "premium"}]
-            ]
-        }
-        # Отображение статуса для админа
-        if user_id in ADMIN_IDS:
-            premium_status = "✅ Бессрочно (админ)"
-        else:
-            premium_status = "✅ Активна" if is_premium(user_id) else "❌ Неактивна"
+        premium_status = "✅ Бессрочно (админ)" if user_id in ADMIN_IDS else ("✅ Активна" if is_premium(user_id) else "❌ Неактивна")
         send_telegram_message(chat_id,
                               f"🎓 Привет, {first_name}!\n\n"
                               f"Я StudyHelperBot — твой AI-ассистент для учёбы.\n\n"
                               f"📊 Статус: Премиум {premium_status}\n"
                               f"🔓 Бесплатно: 5 запросов/день (для админа безлимит)\n\n"
                               f"Выбери действие:",
-                              json.dumps(kb))
+                              json.dumps(get_main_keyboard()))
         return
 
     elif text == "/help":
         send_telegram_message(chat_id,
                               "📖 **Доступные команды:**\n"
                               "/start — Главное меню\n"
+                              "/menu — Показать главное меню\n"
                               "/premium — Подписка\n"
                               "/help — Эта справка\n\n"
                               "**Как пользоваться:**\n"
-                              "1. Напиши /start и выбери функцию\n"
-                              "2. Загрузи текст для пересказа или напиши тему теста/эссе\n"
-                              "3. Получи ответ от AI")
+                              "1. Напиши /start или /menu\n"
+                              "2. Выбери действие из кнопок\n"
+                              "3. Введи текст (тему или сам текст) и получи ответ от AI")
         return
 
     elif text == "/premium":
@@ -243,6 +239,10 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
+    elif text == "/menu" or text.lower() == "меню":
+        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
+        return
+
     # Обычное сообщение (не команда)
     if not can_make_request(user_id):
         send_telegram_message(chat_id,
@@ -251,10 +251,10 @@ def handle_telegram_update(update):
                               "/premium")
         return
 
-    # Если пользователь отправил текст, но не выбрал функцию, напоминаем про кнопки
+    # Если нет состояния – напоминаем
     send_telegram_message(chat_id,
                           "Сначала выбери действие, нажав на кнопку в меню.\n"
-                          "Если меню не видно, напиши /start")
+                          "Если меню не видно, напиши /menu")
 
 def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
@@ -301,6 +301,8 @@ def handle_callback(callback):
                               "После оплаты подписка активируется автоматически.\n"
                               "🔗 Нажми на кнопку ниже:",
                               json.dumps(kb))
+        # Вернём главное меню
+        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
         return
 
     elif data == "referral":
@@ -309,11 +311,12 @@ def handle_callback(callback):
                               f"🎁 **Реферальная программа**\n\n"
                               f"Твоя ссылка:\n`{ref_link}`\n\n"
                               "Приведи друга — получи скидку 20% на следующий месяц!")
+        # Вернём главное меню
+        send_telegram_message(chat_id, "📋 Главное меню:", json.dumps(get_main_keyboard()))
         return
 
 # ================== ОБРАБОТКА СООБЩЕНИЙ С УЧЁТОМ СОСТОЯНИЯ ==================
 def handle_text_message(user_id, chat_id, text):
-    # Получаем состояние пользователя
     if not hasattr(handle_callback, 'user_states'):
         handle_callback.user_states = {}
     state = handle_callback.user_states.get(user_id)
@@ -323,72 +326,35 @@ def handle_text_message(user_id, chat_id, text):
         save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
         del handle_callback.user_states[user_id]
-        kb = {
-            "inline_keyboard": [
-                [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-                [{"text": "📝 Создать тест", "callback_data": "test"}],
-                [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-                [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-                [{"text": "⭐ Премиум", "callback_data": "premium"}]
-            ]
-        }
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(kb))
+        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
 
     elif state == "test":
         reply = generate_test(text)
         save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
         del handle_callback.user_states[user_id]
-        kb = {
-            "inline_keyboard": [
-                [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-                [{"text": "📝 Создать тест", "callback_data": "test"}],
-                [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-                [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-                [{"text": "⭐ Премиум", "callback_data": "premium"}]
-            ]
-        }
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(kb))
+        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
 
     elif state == "explain":
         reply = explain_concept(text)
         save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
         del handle_callback.user_states[user_id]
-        kb = {
-            "inline_keyboard": [
-                [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-                [{"text": "📝 Создать тест", "callback_data": "test"}],
-                [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-                [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-                [{"text": "⭐ Премиум", "callback_data": "premium"}]
-            ]
-        }
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(kb))
+        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
 
     elif state == "essay":
         reply = generate_essay(text)
         save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
         del handle_callback.user_states[user_id]
-        kb = {
-            "inline_keyboard": [
-                [{"text": "📝 Пересказать текст", "callback_data": "summarize"}],
-                [{"text": "📝 Создать тест", "callback_data": "test"}],
-                [{"text": "🔍 Объяснить понятие", "callback_data": "explain"}],
-                [{"text": "✍️ Написать эссе", "callback_data": "essay"}],
-                [{"text": "⭐ Премиум", "callback_data": "premium"}]
-            ]
-        }
-        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(kb))
+        send_telegram_message(chat_id, "Что ещё сделать?", json.dumps(get_main_keyboard()))
 
     else:
-        # Нет состояния – просто напоминаем про кнопки
         send_telegram_message(chat_id,
                               "Сначала выбери действие, нажав на кнопку в меню.\n"
-                              "Если меню не видно, напиши /start")
+                              "Если меню не видно, напиши /menu")
 
-# ================== ОБНОВЛЁННЫЙ ВЕБХУК ==================
+# ================== ВЕБХУК ==================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     update = request.get_json()

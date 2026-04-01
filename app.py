@@ -1,12 +1,10 @@
-# app.py (финальная версия с исправленным URL для YandexART)
+# app.py (без генерации изображений, все остальные функции работают)
 import os
 import logging
 import json
 import requests
 import sqlite3
 import base64
-import time
-import socket
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -170,8 +168,8 @@ def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню")
             ["📝 Пересказать текст", "📝 Создать тест"],
             ["🔍 Объяснить понятие", "✍️ Написать эссе"],
             ["🔢 Реши задачу", "📷 Распознать текст"],
-            ["🎨 Сгенерировать изображение", "🎤 Распознать голос"],
-            ["⭐ Премиум", "🎁 Рефералка"]
+            ["🎤 Распознать голос", "⭐ Премиум"],
+            ["🎁 Рефералка"]
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False
@@ -266,66 +264,6 @@ def recognize_image(file_content: bytes) -> str:
     except Exception as e:
         logging.error(f"Vision error: {e}")
         return "⚠️ Не удалось распознать изображение."
-
-# ================== YANDEXART (генерация изображений) с исправленным URL ==================
-def check_dns(hostname):
-    try:
-        socket.gethostbyname(hostname)
-        return True
-    except socket.error:
-        return False
-
-def generate_image(prompt: str) -> bytes:
-    # Проверка DNS
-    if not check_dns("api.ai.cloud.yandex.net"):
-        return None
-    url = "https://api.ai.cloud.yandex.net/art/v1/images/generation"
-    headers = {
-        "Authorization": f"Api-Key {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "modelUri": f"art://{FOLDER_ID}/yandex-art/latest",
-        "generationOptions": {"seed": 0},
-        "messages": [{"role": "user", "text": prompt}]
-    }
-
-    for attempt in range(2):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code != 200:
-                logging.error(f"ImageGeneration create error: {resp.status_code} {resp.text}")
-                return None
-            operation_id = resp.json().get("id")
-            if not operation_id:
-                return None
-            break
-        except requests.exceptions.RequestException as e:
-            logging.error(f"ImageGeneration create exception (attempt {attempt+1}): {e}")
-            if attempt == 0:
-                time.sleep(3)
-                continue
-            else:
-                return None
-
-    status_url = f"https://api.ai.cloud.yandex.net/art/v1/images/generation/{operation_id}"
-    for _ in range(15):
-        time.sleep(2)
-        try:
-            status_resp = requests.get(status_url, headers=headers, timeout=10)
-            if status_resp.status_code != 200:
-                continue
-            data = status_resp.json()
-            if data.get("done"):
-                image_base64 = data.get("response", {}).get("image")
-                if image_base64:
-                    return base64.b64decode(image_base64)
-                else:
-                    return None
-        except Exception as e:
-            logging.error(f"ImageGeneration status check error: {e}")
-            continue
-    return None
 
 # ================== YANDEX SPEECHKIT STT (распознавание речи) ==================
 def recognize_speech(file_content: bytes) -> str:
@@ -429,10 +367,9 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    # Обработка кнопок (включая новую "📷 Распознать текст")
+    # Обработка кнопок обычной клавиатуры (без генерации изображений)
     if text in ["📝 Пересказать текст", "📝 Создать тест", "🔍 Объяснить понятие",
-                "✍️ Написать эссе", "🔢 Реши задачу", "🎨 Сгенерировать изображение",
-                "📷 Распознать текст", "🖼 Распознать изображение"]:
+                "✍️ Написать эссе", "🔢 Реши задачу", "📷 Распознать текст"]:
         if not can_make_request(user_id):
             send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. /premium")
             return
@@ -442,9 +379,7 @@ def handle_telegram_update(update):
             "🔍 Объяснить понятие": "explain",
             "✍️ Написать эссе": "essay",
             "🔢 Реши задачу": "solve_task",
-            "🎨 Сгенерировать изображение": "generate_image",
-            "📷 Распознать текст": "recognize_image",
-            "🖼 Распознать изображение": "recognize_image"
+            "📷 Распознать текст": "recognize_image"
         }
         state = mapping[text]
         prompts = {
@@ -453,7 +388,6 @@ def handle_telegram_update(update):
             "explain": "🔍 Напиши понятие для объяснения.",
             "essay": "✍️ Напиши тему эссе.",
             "solve_task": "🔢 Напиши условие задачи.",
-            "generate_image": "🎨 Напиши описание для изображения.",
             "recognize_image": "🖼 Отправьте изображение для распознавания текста."
         }
         remove_keyboard(chat_id, prompts[state])
@@ -504,24 +438,8 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
         reply = generate_essay(text)
     elif state == "solve_task":
         reply = solve_task(text)
-    elif state == "generate_image":
-        send_telegram_message(chat_id, "🎨 Генерирую изображение, это займёт до 15 секунд...")
-        img_data = generate_image(text)
-        if img_data:
-            send_telegram_photo(chat_id, img_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
-        else:
-            if not check_dns("api.ai.cloud.yandex.net"):
-                reply = "⚠️ Не удалось подключиться к серверу YandexART. Проверьте доступность api.ai.cloud.yandex.net."
-            else:
-                reply = "⚠️ Не удалось сгенерировать изображение. Возможные причины: недостаточно прав (роль `ai.art.user` у сервисного аккаунта) или временные проблемы с сервером."
-        decrement_request(user_id)
-        del user_states[user_id]
-        if reply:
-            send_telegram_message(chat_id, reply)
-        send_main_keyboard(chat_id, "Что ещё сделать?")
-        return
     else:
-        # Медиа обрабатываются отдельно в handle_media
+        # Медиа обрабатываются отдельно
         send_telegram_message(chat_id, "Пожалуйста, используйте кнопки для выбора действия.")
         del user_states[user_id]
         send_main_keyboard(chat_id)

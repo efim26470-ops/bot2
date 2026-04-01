@@ -1,11 +1,9 @@
-# app.py (расширенная система подписок)
+# app.py (без генерации изображений, админ бессрочно)
 import os
 import logging
 import json
 import requests
 import sqlite3
-import time
-import base64
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -28,7 +26,6 @@ def get_db_connection():
 def init_db():
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Новая структура таблицы users
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -68,7 +65,6 @@ init_db()
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def get_user_info(user_id: int):
-    """Возвращает информацию о пользователе из БД"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT subscription_type, subscription_end, requests_remaining, last_request_date FROM users WHERE user_id = ?", (user_id,))
@@ -83,7 +79,6 @@ def get_user_info(user_id: int):
         }
 
 def update_user_subscription(user_id: int, plan_type: str, days: int, requests_limit: int):
-    """Обновляет подписку пользователя"""
     end_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d')
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -95,7 +90,6 @@ def update_user_subscription(user_id: int, plan_type: str, days: int, requests_l
         conn.commit()
 
 def refresh_free_requests(user_id: int):
-    """Для бесплатных пользователей обновляет requests_remaining до 5, если сегодня ещё не обновлялись"""
     today = datetime.now().date().isoformat()
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -112,13 +106,12 @@ def refresh_free_requests(user_id: int):
         return None
 
 def can_make_request(user_id: int) -> bool:
-    """Проверяет, может ли пользователь сделать запрос (учитывая подписку и лимиты)"""
+    # Администраторы имеют бессрочный доступ (безлимит)
     if user_id in ADMIN_IDS:
         return True
 
     user = get_user_info(user_id)
     if not user:
-        # Новый пользователь
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO users (user_id, requests_remaining, last_request_date) VALUES (?, 5, ?)", 
@@ -126,7 +119,7 @@ def can_make_request(user_id: int) -> bool:
             conn.commit()
         return True
 
-    # Если подписка активна
+    # Если подписка активна (не free)
     if user["type"] != "free":
         if user["end_date"] and user["end_date"] >= datetime.now().date().isoformat():
             return user["remaining"] > 0
@@ -141,11 +134,10 @@ def can_make_request(user_id: int) -> bool:
 
     # Бесплатный пользователь – обновляем дневной лимит
     refresh_free_requests(user_id)
-    user = get_user_info(user_id)  # обновляем данные
+    user = get_user_info(user_id)
     return user["remaining"] > 0
 
 def decrement_request(user_id: int):
-    """Уменьшает счётчик запросов для пользователя"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET requests_remaining = requests_remaining - 1 WHERE user_id = ?", (user_id,))
@@ -165,19 +157,13 @@ def send_telegram_message(chat_id: int, text: str, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(url, json=payload)
 
-def send_telegram_photo(chat_id: int, photo_data: bytes, caption: str = ""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": photo_data}
-    data = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
-    requests.post(url, data=data, files=files)
-
 def send_main_keyboard(chat_id: int, text: str = "📋 Главное меню"):
     keyboard = {
         "keyboard": [
             ["📝 Пересказать текст", "📝 Создать тест"],
             ["🔍 Объяснить понятие", "✍️ Написать эссе"],
-            ["🔢 Реши задачу", "🎨 Сгенерировать изображение"],
-            ["⭐ Премиум", "🎁 Рефералка"]
+            ["🔢 Реши задачу", "⭐ Премиум"],
+            ["🎁 Рефералка"]
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False
@@ -236,49 +222,6 @@ def solve_task(problem: str) -> str:
     system = "Ты — эксперт по решению задач. Помоги пользователю решить задачу шаг за шагом. Если задача не указана, попроси её сформулировать."
     return call_yandexgpt(system, f"Реши задачу:\n{problem}")
 
-# ================== YANDEXART (ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ) ==================
-def generate_image(prompt: str, chat_id: int) -> str:
-    url = "https://api.ai.yandex.net/art/v1/images/generation"
-    headers = {
-        "Authorization": f"Api-Key {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "modelUri": f"art://{FOLDER_ID}/yandex-art/latest",
-        "generationOptions": {"seed": 0},
-        "messages": [{"role": "user", "text": prompt}]
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
-            logging.error(f"YandexART create error: {resp.status_code} {resp.text}")
-            return None
-        operation_id = resp.json().get("id")
-        if not operation_id:
-            return None
-    except Exception as e:
-        logging.error(f"YandexART create exception: {e}")
-        return None
-
-    status_url = f"https://api.ai.yandex.net/art/v1/images/generation/{operation_id}"
-    for _ in range(15):
-        time.sleep(2)
-        try:
-            status_resp = requests.get(status_url, headers=headers, timeout=10)
-            if status_resp.status_code != 200:
-                continue
-            data = status_resp.json()
-            if data.get("done"):
-                image_base64 = data.get("response", {}).get("image")
-                if image_base64:
-                    return image_base64
-                else:
-                    return None
-        except Exception as e:
-            logging.error(f"YandexART status check error: {e}")
-            continue
-    return None
-
 # ================== ОБРАБОТЧИКИ TELEGRAM ==================
 user_states = {}
 
@@ -293,23 +236,22 @@ def handle_telegram_update(update):
     first_name = msg["from"].get("first_name", "")
     username = msg["from"].get("username", "")
 
-    # Регистрируем пользователя (если новый)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
                        (user_id, username, first_name))
         conn.commit()
 
-    # Если есть активное состояние
     state = user_states.get(user_id)
     if state:
         handle_state_input(user_id, chat_id, text, state)
         return
 
-    # Обработка команд и кнопок
     if text == "/start":
         user = get_user_info(user_id)
-        if user and user["type"] != "free":
+        if user_id in ADMIN_IDS:
+            premium_status = "✅ Бессрочно (админ)"
+        elif user and user["type"] != "free":
             premium_status = f"✅ {user['type'].upper()} до {user['end_date']} (осталось {user['remaining']} запросов)"
         else:
             premium_status = "❌ Неактивна"
@@ -354,20 +296,18 @@ def handle_telegram_update(update):
                               json.dumps(kb))
         return
 
-    # Кнопки обычной клавиатуры
-    elif text in ["📝 Пересказать текст", "📝 Создать тест", "🔍 Объяснить понятие",
-                  "✍️ Написать эссе", "🔢 Реши задачу", "🎨 Сгенерировать изображение"]:
+    # Обработка кнопок обычной клавиатуры
+    if text in ["📝 Пересказать текст", "📝 Создать тест", "🔍 Объяснить понятие",
+                "✍️ Написать эссе", "🔢 Реши задачу"]:
         if not can_make_request(user_id):
             send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. Приобретите подписку: /premium")
             return
-        # Определяем состояние
         mapping = {
             "📝 Пересказать текст": "summarize",
             "📝 Создать тест": "test",
             "🔍 Объяснить понятие": "explain",
             "✍️ Написать эссе": "essay",
-            "🔢 Реши задачу": "solve_task",
-            "🎨 Сгенерировать изображение": "generate_image"
+            "🔢 Реши задачу": "solve_task"
         }
         state = mapping[text]
         prompts = {
@@ -375,14 +315,12 @@ def handle_telegram_update(update):
             "test": "📝 Напиши тему, по которой создать тест.",
             "explain": "🔍 Напиши понятие, которое нужно объяснить.",
             "essay": "✍️ Напиши тему эссе.",
-            "solve_task": "🔢 Напиши условие задачи.",
-            "generate_image": "🎨 Напиши описание того, что нужно нарисовать."
+            "solve_task": "🔢 Напиши условие задачи."
         }
         remove_keyboard(chat_id, prompts[state])
         user_states[user_id] = state
 
     elif text == "⭐ Премиум":
-        # Отправляем инлайн-кнопки с тарифами
         kb = {
             "inline_keyboard": [
                 [{"text": "💎 Премиум (250 запросов/мес) — 150 руб", "callback_data": "buy_premium"}],
@@ -403,7 +341,6 @@ def handle_telegram_update(update):
                               "Если клавиатура не отображается, нажми /start")
 
 def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
-    # Проверяем лимит ещё раз (на случай, если пользователь долго думал)
     if not can_make_request(user_id):
         send_telegram_message(chat_id, "⚠️ Лимит запросов исчерпан. Приобретите подписку: /premium")
         del user_states[user_id]
@@ -413,46 +350,26 @@ def handle_state_input(user_id: int, chat_id: int, text: str, state: str):
     reply = None
     if state == "summarize":
         reply = summarize_text(text)
-        save_query(user_id, text, reply)
     elif state == "test":
         reply = generate_test(text)
-        save_query(user_id, text, reply)
     elif state == "explain":
         reply = explain_concept(text)
-        save_query(user_id, text, reply)
     elif state == "essay":
         reply = generate_essay(text)
-        save_query(user_id, text, reply)
     elif state == "solve_task":
         reply = solve_task(text)
-        save_query(user_id, text, reply)
-    elif state == "generate_image":
-        send_telegram_message(chat_id, "🎨 Генерирую изображение, это может занять до 15 секунд...")
-        img_base64 = generate_image(text, chat_id)
-        if img_base64:
-            try:
-                image_data = base64.b64decode(img_base64)
-                send_telegram_photo(chat_id, image_data, caption=f"🎨 *Ваше изображение*\nПромпт: {text[:100]}")
-            except Exception as e:
-                logging.error(f"Image send error: {e}")
-                reply = "⚠️ Не удалось отправить изображение. Попробуйте позже."
-        else:
-            reply = "⚠️ Не удалось сгенерировать изображение. Проверьте, что у сервисного аккаунта есть роль `ai.art.user`, или попробуйте другой промпт."
-        if reply:
-            save_query(user_id, text, reply)
     else:
         reply = "Неизвестное действие."
 
-    # Уменьшаем счётчик запросов, если это не изображение или изображение успешно отправлено
-    if state != "generate_image" or (state == "generate_image" and not img_base64):
-        decrement_request(user_id)
-
     if reply:
+        save_query(user_id, text, reply)
         send_telegram_message(chat_id, reply)
 
-    # Сбрасываем состояние и возвращаем клавиатуру
-    if user_id in user_states:
-        del user_states[user_id]
+    # Уменьшаем счётчик только если пользователь не админ (админам безлимит)
+    if user_id not in ADMIN_IDS:
+        decrement_request(user_id)
+
+    del user_states[user_id]
     send_main_keyboard(chat_id, "Что ещё сделать?")
 
 # ================== CALLBACK-ОБРАБОТЧИКИ (инлайн-кнопки) ==================
@@ -460,7 +377,6 @@ def handle_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
     user_id = callback["from"]["id"]
     data = callback["data"]
-    # Отвечаем на callback
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
                   json={"callback_query_id": callback["id"]})
 
@@ -472,10 +388,16 @@ def handle_callback(callback):
         plan = "premium_plus"
         amount = 300
         requests_limit = 500
+    elif data == "referral":
+        ref_link = f"https://t.me/unistudyhelper_bot?start=ref_{user_id}"
+        send_telegram_message(chat_id,
+                              f"🎁 **Реферальная программа**\n\n"
+                              f"Твоя ссылка:\n`{ref_link}`\n\n"
+                              "Приведи друга — получи скидку 20% на следующий месяц!")
+        return
     else:
         return
 
-    # Ссылка на платёжную страницу (замените на реальную)
     payment_link = f"https://your-tilda-site.ru/payment?user_id={user_id}&plan={plan}"
     kb = {"inline_keyboard": [[{"text": f"💳 Оплатить {amount} руб", "url": payment_link}]]}
     send_telegram_message(chat_id,
